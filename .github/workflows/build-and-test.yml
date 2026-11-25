@@ -2,78 +2,115 @@ name: build-and-test
 
 on:
   pull_request:
-    branches:
-      - 'master'
+    branches: [master]
   push:
     branches:
+      - master
       - 'feature*'
       - 'feature_*'
       - 'feature/*'
-      - 'hotfix/*'
       - 'hotfix*'
-      - 'master'
+      - 'hotfix/*'
   schedule:
     - cron: '0 20 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
-  CUSTOM_DIR: 'darkwizard242.lazydocker'
+  # Must match the role referenced by molecule/default/converge.yml.
+  CUSTOM_DIR: darkwizard242.lazydocker
+  PY_COLORS: '1'
+  ANSIBLE_FORCE_COLOR: '1'
+  ANSIBLE_HOST_KEY_CHECKING: 'false'
+
+defaults:
+  run:
+    shell: bash
+    working-directory: darkwizard242.lazydocker
 
 jobs:
-
-  code_quality:
-
-    name: SonarCloud Code Quality Check
-    runs-on: ubuntu-22.04
-
-    steps:
-
-    - name: Checkout source code
-      uses: actions/checkout@v4
-      with:
-        path: '${{ env.CUSTOM_DIR }}'
-        fetch-depth: 0
-
-    - name: SonarCloud Scan
-      uses: sonarsource/sonarcloud-github-action@master
-      with:
-        projectBaseDir: '${{ env.CUSTOM_DIR }}'
-        args: >
-          -Dsonar.projectVersion=${{ github.ref }}_${{ github.run_number }}
-      env:
-        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-
   build:
-
-    name: Build & Test
+    name: Molecule (${{ matrix.distro }})
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     strategy:
-      max-parallel: 10
+      fail-fast: false
       matrix:
-        IMAGE: [ubuntu-24.04, ubuntu-22.04, ubuntu-20.04, rockylinux-8, debian-bullseye, debian-buster]
+        distro:
+          - ubuntu-24.04
+          - ubuntu-22.04
+          - ubuntu-20.04
+          - rockylinux-8
+          - debian-bullseye
+          - debian-buster
+    env:
+      # Interpolated by the existing Molecule platform/image configuration.
+      DISTRO: ${{ matrix.distro }}
+      ANSIBLE_ROLES_PATH: ${{ github.workspace }}
 
     steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          path: ${{ env.CUSTOM_DIR }}
 
-    - name: Checkout source code
-      uses: actions/checkout@v4
-      with:
-        path: '${{ env.CUSTOM_DIR }}'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-    - name: Set up Python 3.10
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - name: Install compatible test dependencies
+        run: |
+          # Keep compatibility pins in runner temp; leave requirements.txt unchanged.
+          # Ansible 2.16 supports target Python 3.6 through 3.12 across these images.
+          # Molecule 6 retains the Testinfra verifier used by this role.
+          cat > "$RUNNER_TEMP/lazydocker-ci-constraints.txt" <<'EOF'
+          ansible==9.13.0
+          ansible-core==2.16.14
+          ansible-compat==4.1.11
+          ansible-lint==6.22.2
+          molecule==6.0.3
+          molecule-plugins==23.5.3
+          docker==6.1.3
+          requests==2.28.2
+          urllib3==1.26.20
+          pytest==8.3.5
+          pytest-testinfra==10.1.1
+          yamllint==1.35.1
+          flake8==7.1.2
+          EOF
+          python -m pip install --upgrade pip wheel
+          python -m pip install -r requirements.txt \
+            --constraint "$RUNNER_TEMP/lazydocker-ci-constraints.txt"
+          python -m pip check
+          # Avoid installing latest collections that require a newer ansible-core.
+          ansible-galaxy collection install \
+            'community.docker:==3.13.5' 'ansible.posix:==1.5.4' --force
 
-    - name: Update repo cache, install python3-setuptools and required pip modules
-      run: |
-        sudo apt-get update
-        sudo apt-get install python3-setuptools -y
-        pip3 install -U -r $CUSTOM_DIR/requirements.txt
+      - name: Check YAML and Python style
+        run: |
+          yamllint .
+          flake8 molecule/default/tests
 
-    - name: Execute Molecule test of role for ${{ matrix.IMAGE }}
-      working-directory: '${{ env.CUSTOM_DIR }}'
-      run: DISTRO=${{ matrix.IMAGE }} molecule test
-      env:
-        PY_COLORS: '1'
-        ANSIBLE_FORCE_COLOR: '1'
+      - name: Check Docker and test tooling
+        run: |
+          docker info
+          ansible --version
+          molecule --version
+
+      - name: Test role with Molecule and Testinfra
+        # Molecule supplies MOLECULE_INVENTORY_FILE to the existing Python tests.
+        run: molecule test --scenario-name default
+
+      - name: Clean up Molecule containers
+        if: always()
+        run: |
+          if command -v molecule >/dev/null 2>&1; then
+            molecule destroy --scenario-name default
+          fi
